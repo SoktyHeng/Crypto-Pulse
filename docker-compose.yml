@@ -1,0 +1,116 @@
+# CryptoPulse AI — local development stack (M0).
+# Usage: cp .env.example .env && docker compose up --build -d
+# Every variable has a safe local default, so the stack also starts without a .env file.
+#
+# M0 services: postgres, migrate (one-off), api, web.
+# collector / prediction-worker / outcome-worker / training are added by the milestones
+# that implement them (M1, M4, M3) — see docs/DECISIONS.md ADR-006.
+
+name: cryptopulse
+
+x-backend-env: &backend-env
+  APP_ENV: ${APP_ENV:-development}
+  LOG_LEVEL: ${LOG_LEVEL:-INFO}
+  DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://cryptopulse:local_change_me@postgres:5432/cryptopulse}
+  TEST_DATABASE_URL: ${TEST_DATABASE_URL:-postgresql+psycopg://cryptopulse:local_change_me@postgres:5432/postgres}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+  BINANCE_REST_BASE: ${BINANCE_REST_BASE:-https://data-api.binance.vision}
+  BINANCE_WS_BASE: ${BINANCE_WS_BASE:-wss://data-stream.binance.vision:443}
+  SUPPORTED_SYMBOLS: ${SUPPORTED_SYMBOLS:-BTCUSDT,ETHUSDT,SOLUSDT}
+  PRIMARY_CANDLE_INTERVAL: ${PRIMARY_CANDLE_INTERVAL:-1m}
+  PREDICTION_HORIZONS_MINUTES: ${PREDICTION_HORIZONS_MINUTES:-15,30,60,240}
+  MAX_CANDLE_STALENESS_SECONDS: ${MAX_CANDLE_STALENESS_SECONDS:-120}
+  MODEL_ARTIFACT_DIR: ${MODEL_ARTIFACT_DIR:-/app/artifacts/models}
+  ENABLE_DEMO_MODE: ${ENABLE_DEMO_MODE:-false}
+
+x-backend-build: &backend-build
+  context: ./services/backend
+  target: dev
+
+services:
+  postgres:
+    image: postgres:17.6-bookworm
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cryptopulse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-cryptopulse}
+      TZ: UTC
+      PGTZ: UTC
+    ports:
+      # Bound to loopback only: the database is never exposed on the LAN.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    mem_limit: 1g
+
+  # Single, explicit migration step. Workers and the API never run migrations themselves.
+  migrate:
+    build: *backend-build
+    image: cryptopulse-backend:dev
+    command: ["alembic", "upgrade", "head"]
+    environment: *backend-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: *backend-build
+    image: cryptopulse-backend:dev
+    environment: *backend-env
+    volumes:
+      - model_artifacts:/app/artifacts/models
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/system/health', timeout=3)"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+    mem_limit: 512m
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        # Browser-facing API address (host machine), baked into the client bundle.
+        NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+    image: cryptopulse-web:local
+    ports:
+      - "127.0.0.1:${WEB_HOST_PORT:-3000}:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+    mem_limit: 768m
+
+volumes:
+  pgdata:
+  model_artifacts:
